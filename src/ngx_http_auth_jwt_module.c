@@ -73,6 +73,7 @@ static char *ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void
 
 static void ngx_http_auth_jwt_exit_process(ngx_cycle_t *cycle);
 
+static ngx_int_t ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_preaccess_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_access_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase);
@@ -150,6 +151,7 @@ typedef const char *(*auth_jwt_get)(jwt_t *jwt, const char *key, const char *del
 typedef char *(*auth_jwt_get_json)(jwt_t *jwt, const char *key, const char *delim, const char *quote);
 
 static ngx_conf_enum_t ngx_http_auth_jwt_phases[] = {
+  { ngx_string("REWRITE"), NGX_HTTP_REWRITE_PHASE },
   { ngx_string("PREACCESS"), NGX_HTTP_PREACCESS_PHASE },
   { ngx_string("ACCESS"), NGX_HTTP_ACCESS_PHASE },
   { ngx_null_string, 0 }
@@ -1314,6 +1316,12 @@ ngx_http_auth_jwt_post_conf(ngx_conf_t *cf)
 
   conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
+  handler = ngx_array_push(&conf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+  if (handler == NULL) {
+    return NGX_ERROR;
+  }
+  *handler = ngx_http_auth_jwt_rewrite_handler;
+
   handler = ngx_array_push(&conf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
   if (handler == NULL) {
     return NGX_ERROR;
@@ -1667,9 +1675,9 @@ ngx_http_auth_jwt_response(ngx_http_request_t *r,
 
 #define ngx_http_auth_jwt_http_ok() ngx_http_auth_jwt_response(r, cf, ctx, 0, NGX_OK)
 #define ngx_http_auth_jwt_http_error_without_token() \
-  (cf->allow_failed ? NGX_OK : ngx_http_auth_jwt_response(r, cf, ctx, 0, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
+  (cf->allow_failed ? NGX_DECLINED : ngx_http_auth_jwt_response(r, cf, ctx, 0, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
 #define ngx_http_auth_jwt_http_error() \
-  (cf->allow_failed ? NGX_OK : ngx_http_auth_jwt_response(r, cf, ctx, 1, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
+  (cf->allow_failed ? NGX_DECLINED : ngx_http_auth_jwt_response(r, cf, ctx, 1, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
 
 static ngx_int_t
 ngx_http_auth_jwt_key_request_handler(ngx_http_request_t *r,
@@ -2244,6 +2252,12 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
 }
 
 static ngx_int_t
+ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r)
+{
+  return ngx_http_auth_jwt_handler(r, NGX_HTTP_REWRITE_PHASE);
+}
+
+static ngx_int_t
 ngx_http_auth_jwt_preaccess_handler(ngx_http_request_t *r)
 {
   return ngx_http_auth_jwt_handler(r, NGX_HTTP_PREACCESS_PHASE);
@@ -2272,12 +2286,18 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   if (cf->phase != phase) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                   "auth_jwt: ignore phase: %s",
-                  phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS");
+                  phase == NGX_HTTP_REWRITE_PHASE ? "REWRITE" :
+                  (phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS"));
     return NGX_DECLINED;
   }
 
   ctx = ngx_http_auth_jwt_get_module_ctx(r);
   if (ctx != NULL) {
+    /* For rewrite phase, just skip if already processed */
+    if (phase == NGX_HTTP_REWRITE_PHASE) {
+      return NGX_DECLINED;
+    }
+
     if (ctx->done < ctx->subrequest) {
       return NGX_AGAIN;
     }
@@ -2366,6 +2386,11 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   /* validate */
   if (ngx_http_auth_jwt_validate(r, cf, ctx) == NGX_ERROR) {
     return ngx_http_auth_jwt_http_error();
+  }
+
+  /* For rewrite phase, continue to next handlers (if, rewrite, etc.) */
+  if (phase == NGX_HTTP_REWRITE_PHASE) {
+    return NGX_DECLINED;
   }
 
   return ngx_http_auth_jwt_http_ok();

@@ -247,18 +247,26 @@ when verifying the exp and nbf JWT claims.
 
 <a name="auth_jwt_phase"></a>
 ```
-Syntax: auth_jwt_phase preaccess | access;
+Syntax: auth_jwt_phase rewrite | preaccess | access;
 Default: auth_jwt_phase access;
 Context: http, server, location
 ```
 
 Specifies the phase to be processed.
 
+- `rewrite` - JWT is validated during the rewrite phase, **before** `if` directives.
+  This allows using `$jwt_status` in `if` conditions.
+- `preaccess` - JWT is validated during the preaccess phase.
+- `access` - JWT is validated during the access phase (default).
+
 > ACCESS phase is not executed when a call is made from a subrequest.
 >
 > In the case of a call from a subrequest,
 > [auth\_jwt\_key\_request](#auth_jwt_key_request) cannot
 > be processed. (nested in-memory subrequest)
+
+> **Note:** When using `phase=rewrite`, the `$jwt_status` variable becomes
+> available in `if` directives for custom authentication flows.
 
 <a name="auth_jwt_revocation_list_sub"></a>
 ```
@@ -483,27 +491,69 @@ via `$jwt_status` and `$jwt_status_code` variables.
 This allows custom handling of authentication failures using `if` directives
 or passing the status to backend services.
 
+> **Important:** To use `$jwt_status` in `if` directives, you must set
+> `auth_jwt_phase rewrite;` because `if` directives are processed during
+> the rewrite phase, which runs before the default access phase.
+
 > Examples:
-> ```
-> location /api/ {
->     auth_jwt "API";
+>
+> **Using with `if` directives (requires `phase=rewrite`):**
+> ```nginx
+> server {
+>     auth_jwt "realm" phase=rewrite;
 >     auth_jwt_key_file /etc/nginx/keys.jwks;
 >     auth_jwt_allow_failed on;
 >
->     # Custom handling based on JWT status
->     if ($jwt_status != "ok") {
->         return 401 "JWT validation failed: $jwt_status";
+>     # Redirect to login if no token or invalid token
+>     if ($jwt_status = "no_token") {
+>         return 302 /login?return=$request_uri;
+>     }
+>     if ($jwt_status = "expired") {
+>         return 302 /login?return=$request_uri;
+>     }
+>     if ($jwt_status = "invalid_token") {
+>         return 302 /login?return=$request_uri;
 >     }
 >
->     proxy_pass http://backend;
+>     location / {
+>         proxy_pass http://backend;
+>     }
+> }
+> ```
+>
+> **Conditional JWT validation with `map`:**
+> ```nginx
+> map $request_uri $jwt_required {
+>     ~^/api/public/  0;
+>     ~^/api/         1;
+>     default         0;
 > }
 >
+> server {
+>     auth_jwt "realm" phase=rewrite;
+>     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_allow_failed on;
+>
+>     set $jwt_check "${jwt_required}:${jwt_status}";
+>
+>     # Require valid JWT only for protected paths
+>     if ($jwt_check ~ "^1:(?!ok)") {
+>         return 401;
+>     }
+>
+>     location / {
+>         proxy_pass http://backend;
+>     }
+> }
+> ```
+>
+> **Pass JWT status to backend:**
+> ```nginx
 > location /mixed/ {
 >     auth_jwt "Mixed";
 >     auth_jwt_key_file /etc/nginx/keys.jwks;
 >     auth_jwt_allow_failed on;
 >
->     # Pass JWT status to backend
 >     proxy_set_header X-JWT-Status $jwt_status;
 >     proxy_set_header X-JWT-Status-Code $jwt_status_code;
 >     proxy_pass http://backend;
