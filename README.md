@@ -96,6 +96,7 @@ location / {
 - [auth\_jwt\_require\_claim](#auth_jwt_require_claim)
 - [auth\_jwt\_require\_header](#auth_jwt_require_header)
 - [auth\_jwt\_allow\_nested](#auth_jwt_allow_nested)
+- [auth\_jwt\_allow\_failed](#auth_jwt_allow_failed)
 
 <a name="auth_jwt"></a>
 ```
@@ -246,18 +247,26 @@ when verifying the exp and nbf JWT claims.
 
 <a name="auth_jwt_phase"></a>
 ```
-Syntax: auth_jwt_phase preaccess | access;
+Syntax: auth_jwt_phase rewrite | preaccess | access;
 Default: auth_jwt_phase access;
 Context: http, server, location
 ```
 
 Specifies the phase to be processed.
 
+- `rewrite` - JWT is validated during the rewrite phase, **before** `if` directives.
+  This allows using `$jwt_status` in `if` conditions.
+- `preaccess` - JWT is validated during the preaccess phase.
+- `access` - JWT is validated during the access phase (default).
+
 > ACCESS phase is not executed when a call is made from a subrequest.
 >
 > In the case of a call from a subrequest,
 > [auth\_jwt\_key\_request](#auth_jwt_key_request) cannot
 > be processed. (nested in-memory subrequest)
+
+> **Note:** When using `phase=rewrite`, the `$jwt_status` variable becomes
+> available in `if` directives for custom authentication flows.
 
 <a name="auth_jwt_revocation_list_sub"></a>
 ```
@@ -468,6 +477,89 @@ The optional `quote` parameter sets the quote character for the key
 > }
 > ```
 
+<a name="auth_jwt_allow_failed"></a>
+```
+Syntax: auth_jwt_allow_failed on | off;
+Default: auth_jwt_allow_failed off;
+Context: http, server, location, limit_except
+```
+
+When enabled, JWT validation failures will not block the request.
+Instead, the request continues and the validation result is available
+via `$jwt_status` and `$jwt_status_code` variables.
+
+This allows custom handling of authentication failures using `if` directives
+or passing the status to backend services.
+
+> **Important:** To use `$jwt_status` in `if` directives, you must set
+> `auth_jwt_phase rewrite;` because `if` directives are processed during
+> the rewrite phase, which runs before the default access phase.
+
+> Examples:
+>
+> **Using with `if` directives (requires `phase=rewrite`):**
+> ```nginx
+> server {
+>     auth_jwt "realm" phase=rewrite;
+>     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_allow_failed on;
+>
+>     # Redirect to login if no token or invalid token
+>     if ($jwt_status = "no_token") {
+>         return 302 /login?return=$request_uri;
+>     }
+>     if ($jwt_status = "expired") {
+>         return 302 /login?return=$request_uri;
+>     }
+>     if ($jwt_status = "invalid_token") {
+>         return 302 /login?return=$request_uri;
+>     }
+>
+>     location / {
+>         proxy_pass http://backend;
+>     }
+> }
+> ```
+>
+> **Conditional JWT validation with `map`:**
+> ```nginx
+> map $request_uri $jwt_required {
+>     ~^/api/public/  0;
+>     ~^/api/         1;
+>     default         0;
+> }
+>
+> server {
+>     auth_jwt "realm" phase=rewrite;
+>     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_allow_failed on;
+>
+>     set $jwt_check "${jwt_required}:${jwt_status}";
+>
+>     # Require valid JWT only for protected paths
+>     if ($jwt_check ~ "^1:(?!ok)") {
+>         return 401;
+>     }
+>
+>     location / {
+>         proxy_pass http://backend;
+>     }
+> }
+> ```
+>
+> **Pass JWT status to backend:**
+> ```nginx
+> location /mixed/ {
+>     auth_jwt "Mixed";
+>     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_allow_failed on;
+>
+>     proxy_set_header X-JWT-Status $jwt_status;
+>     proxy_set_header X-JWT-Status-Code $jwt_status_code;
+>     proxy_pass http://backend;
+> }
+> ```
+
 ### Embedded Variables
 
 The module supports embedded variables:
@@ -496,6 +588,33 @@ $jwt_nowtime
 ```
 
 Returns the value of now timestamp.
+
+```
+$jwt_status
+```
+
+Returns the JWT validation status as a string. Possible values:
+- `ok` - JWT validation successful
+- `bypass` - JWT validation bypassed
+- `no_token` - No JWT token provided
+- `invalid_token` - JWT token could not be parsed
+- `expired` - JWT token has expired
+- `not_yet_valid` - JWT token is not yet valid (nbf claim)
+- `revoked_sub` - JWT subject is in revocation list
+- `revoked_kid` - JWT key ID is in revocation list
+- `claim_required` - Required claim is missing or invalid
+- `header_required` - Required header is missing or invalid
+- `var_required` - Required variable validation failed
+- `sig_invalid` - JWT signature validation failed
+- `no_key` - No signing key available for validation
+- `alg_none` - Algorithm "none" is not allowed
+- `error` - Internal error occurred
+
+```
+$jwt_status_code
+```
+
+Returns the HTTP status code corresponding to the JWT validation result (e.g., `200`, `401`, `500`).
 
 Example
 -------

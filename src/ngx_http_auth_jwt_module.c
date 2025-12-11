@@ -12,10 +12,49 @@
 #define NGX_HTTP_AUTH_JWT_CLAIM_VAR_PREFIX "jwt_claim_"
 #define NGX_HTTP_AUTH_JWT_HEADER_VAR_PREFIX "jwt_header_"
 
+/* JWT validation status codes */
+typedef enum {
+  NGX_HTTP_AUTH_JWT_STATUS_OK = 0,
+  NGX_HTTP_AUTH_JWT_STATUS_BYPASS,
+  NGX_HTTP_AUTH_JWT_STATUS_NO_TOKEN,
+  NGX_HTTP_AUTH_JWT_STATUS_INVALID_TOKEN,
+  NGX_HTTP_AUTH_JWT_STATUS_EXPIRED,
+  NGX_HTTP_AUTH_JWT_STATUS_NOT_YET_VALID,
+  NGX_HTTP_AUTH_JWT_STATUS_REVOKED_SUB,
+  NGX_HTTP_AUTH_JWT_STATUS_REVOKED_KID,
+  NGX_HTTP_AUTH_JWT_STATUS_CLAIM_REQUIRED,
+  NGX_HTTP_AUTH_JWT_STATUS_HEADER_REQUIRED,
+  NGX_HTTP_AUTH_JWT_STATUS_VAR_REQUIRED,
+  NGX_HTTP_AUTH_JWT_STATUS_SIG_INVALID,
+  NGX_HTTP_AUTH_JWT_STATUS_NO_KEY,
+  NGX_HTTP_AUTH_JWT_STATUS_ALG_NONE,
+  NGX_HTTP_AUTH_JWT_STATUS_ERROR
+} ngx_http_auth_jwt_status_t;
+
+static const char *ngx_http_auth_jwt_status_strings[] = {
+  "ok",
+  "bypass",
+  "no_token",
+  "invalid_token",
+  "expired",
+  "not_yet_valid",
+  "revoked_sub",
+  "revoked_kid",
+  "claim_required",
+  "header_required",
+  "var_required",
+  "sig_invalid",
+  "no_key",
+  "alg_none",
+  "error"
+};
+
 static ngx_int_t ngx_http_auth_jwt_variable_claim(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_auth_jwt_variable_header(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_auth_jwt_variable_claims(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_auth_jwt_variable_nowtime(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_auth_jwt_variable_status(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_auth_jwt_variable_status_code(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 
 static char *ngx_http_auth_jwt_conf_set_token_variable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_auth_jwt_conf_set_claim(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -34,6 +73,7 @@ static char *ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void
 
 static void ngx_http_auth_jwt_exit_process(ngx_cycle_t *cycle);
 
+static ngx_int_t ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_preaccess_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_access_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase);
@@ -46,6 +86,7 @@ typedef struct {
   time_t leeway;
   ngx_int_t phase;
   ngx_flag_t enabled;
+  ngx_flag_t allow_failed;
   ngx_str_t realm;
   struct {
     json_t *subs;
@@ -89,6 +130,8 @@ typedef struct {
   jwt_t *jwt;
   json_t *keys;
   ngx_int_t status;
+  ngx_http_auth_jwt_status_t jwt_status;
+  ngx_int_t http_status;
 } ngx_http_auth_jwt_ctx_t;
 
 typedef struct {
@@ -108,6 +151,7 @@ typedef const char *(*auth_jwt_get)(jwt_t *jwt, const char *key, const char *del
 typedef char *(*auth_jwt_get_json)(jwt_t *jwt, const char *key, const char *delim, const char *quote);
 
 static ngx_conf_enum_t ngx_http_auth_jwt_phases[] = {
+  { ngx_string("REWRITE"), NGX_HTTP_REWRITE_PHASE },
   { ngx_string("PREACCESS"), NGX_HTTP_PREACCESS_PHASE },
   { ngx_string("ACCESS"), NGX_HTTP_ACCESS_PHASE },
   { ngx_null_string, 0 }
@@ -149,6 +193,18 @@ static ngx_http_variable_t ngx_http_auth_jwt_vars[] = {
   { ngx_string("jwt_nowtime"),
     NULL,
     ngx_http_auth_jwt_variable_nowtime,
+    0,
+    NGX_HTTP_VAR_NOCACHEABLE,
+    0 },
+  { ngx_string("jwt_status"),
+    NULL,
+    ngx_http_auth_jwt_variable_status,
+    0,
+    NGX_HTTP_VAR_NOCACHEABLE,
+    0 },
+  { ngx_string("jwt_status_code"),
+    NULL,
+    ngx_http_auth_jwt_variable_status_code,
     0,
     NGX_HTTP_VAR_NOCACHEABLE,
     0 },
@@ -256,6 +312,13 @@ static ngx_command_t ngx_http_auth_jwt_commands[] = {
     ngx_http_auth_jwt_conf_set_allow_nested,
     NGX_HTTP_LOC_CONF_OFFSET,
     0,
+    NULL },
+  { ngx_string("auth_jwt_allow_failed"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF
+    |NGX_CONF_TAKE1,
+    ngx_conf_set_flag_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_auth_jwt_loc_conf_t, allow_failed),
     NULL },
   ngx_null_command
 };
@@ -664,6 +727,64 @@ ngx_http_auth_jwt_variable_nowtime(ngx_http_request_t *r,
 
   v->len = ngx_sprintf(v->data, "%ui", now) - v->data;
 
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
+
+  return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_auth_jwt_variable_status(ngx_http_request_t *r,
+                                  ngx_http_variable_value_t *v,
+                                  uintptr_t data)
+{
+  ngx_http_auth_jwt_ctx_t *ctx;
+  const char *status_str;
+  size_t len;
+
+  ctx = ngx_http_auth_jwt_get_module_ctx(r);
+  if (ctx == NULL) {
+    v->not_found = 1;
+    return NGX_OK;
+  }
+
+  status_str = ngx_http_auth_jwt_status_strings[ctx->jwt_status];
+  len = ngx_strlen(status_str);
+
+  v->data = ngx_pnalloc(r->pool, len);
+  if (v->data == NULL) {
+    return NGX_ERROR;
+  }
+
+  ngx_memcpy(v->data, status_str, len);
+  v->len = len;
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
+
+  return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_auth_jwt_variable_status_code(ngx_http_request_t *r,
+                                       ngx_http_variable_value_t *v,
+                                       uintptr_t data)
+{
+  ngx_http_auth_jwt_ctx_t *ctx;
+
+  ctx = ngx_http_auth_jwt_get_module_ctx(r);
+  if (ctx == NULL) {
+    v->not_found = 1;
+    return NGX_OK;
+  }
+
+  v->data = ngx_pnalloc(r->pool, sizeof("500") - 1);
+  if (v->data == NULL) {
+    return NGX_ERROR;
+  }
+
+  v->len = ngx_sprintf(v->data, "%i", ctx->http_status) - v->data;
   v->valid = 1;
   v->no_cacheable = 0;
   v->not_found = 0;
@@ -1195,6 +1316,12 @@ ngx_http_auth_jwt_post_conf(ngx_conf_t *cf)
 
   conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
+  handler = ngx_array_push(&conf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+  if (handler == NULL) {
+    return NGX_ERROR;
+  }
+  *handler = ngx_http_auth_jwt_rewrite_handler;
+
   handler = ngx_array_push(&conf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
   if (handler == NULL) {
     return NGX_ERROR;
@@ -1239,6 +1366,7 @@ ngx_http_auth_jwt_create_loc_conf(ngx_conf_t *cf)
   conf->nested.quote = NULL;
 
   conf->enabled = NGX_CONF_UNSET;
+  conf->allow_failed = NGX_CONF_UNSET;
 
   return conf;
 }
@@ -1384,6 +1512,7 @@ ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
   ngx_conf_merge_value(conf->validate.sig, prev->validate.sig, 1);
 
   ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
+  ngx_conf_merge_value(conf->allow_failed, prev->allow_failed, 0);
   ngx_conf_merge_str_value(conf->realm, prev->realm, "");
 
   if (prev->revocation.subs) {
@@ -1545,8 +1674,10 @@ ngx_http_auth_jwt_response(ngx_http_request_t *r,
 }
 
 #define ngx_http_auth_jwt_http_ok() ngx_http_auth_jwt_response(r, cf, ctx, 0, NGX_OK)
-#define ngx_http_auth_jwt_http_error_without_token() ngx_http_auth_jwt_response(r, cf, ctx, 0, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED)
-#define ngx_http_auth_jwt_http_error() ngx_http_auth_jwt_response(r, cf, ctx, 1, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED)
+#define ngx_http_auth_jwt_http_error_without_token() \
+  (cf->allow_failed ? NGX_DECLINED : ngx_http_auth_jwt_response(r, cf, ctx, 0, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
+#define ngx_http_auth_jwt_http_error() \
+  (cf->allow_failed ? NGX_DECLINED : ngx_http_auth_jwt_response(r, cf, ctx, 1, ctx->status != 0 ? ctx->status : NGX_HTTP_UNAUTHORIZED))
 
 static ngx_int_t
 ngx_http_auth_jwt_key_request_handler(ngx_http_request_t *r,
@@ -1737,6 +1868,9 @@ ngx_http_auth_jwt_validate_variable(ngx_http_request_t *r,
   ngx_http_complex_value_t *var;
 
   if (!cf->validate.variable.values) {
+    /* validation successful - set OK status */
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_OK;
+    ctx->http_status = NGX_HTTP_OK;
     return NGX_OK;
   }
 
@@ -1749,6 +1883,8 @@ ngx_http_auth_jwt_validate_variable(ngx_http_request_t *r,
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                     "auth_jwt: variable specified was not provided: %V",
                     &(var[i].value));
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_VAR_REQUIRED;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
 
@@ -1758,10 +1894,16 @@ ngx_http_auth_jwt_validate_variable(ngx_http_request_t *r,
                     "auth_jwt: rejected due to %V variable invalid",
                     &(var[i].value));
       ctx->status = cf->validate.variable.error;
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_VAR_REQUIRED;
+      ctx->http_status = cf->validate.variable.error != NGX_CONF_UNSET
+                         ? cf->validate.variable.error : NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
   }
 
+  /* validation successful - set OK status */
+  ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_OK;
+  ctx->http_status = NGX_HTTP_OK;
   return NGX_OK;
 }
 
@@ -1930,6 +2072,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
   if (!cf || !ctx) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "auth_jwt: rejected due to missing required arguments");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_ERROR;
+    ctx->http_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
     return NGX_ERROR;
   }
 
@@ -1941,6 +2085,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
     const char *jwt_sub = jwt_get_grant(ctx->jwt, "sub");
 
     if (jwt_sub == NULL){
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_CLAIM_REQUIRED;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
 
@@ -1953,6 +2099,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
         if (msg) {
           free(msg);
         }
+        ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_REVOKED_SUB;
+        ctx->http_status = NGX_HTTP_UNAUTHORIZED;
         return NGX_ERROR;
       }
     }
@@ -1969,6 +2117,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                     "auth_jwt: rejected due to kid cannot be empty"
                     " when revocation_kids set", kid);
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_HEADER_REQUIRED;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
 
@@ -1981,6 +2131,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
         if (msg) {
           free(msg);
         }
+        ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_REVOKED_KID;
+        ctx->http_status = NGX_HTTP_UNAUTHORIZED;
         return NGX_ERROR;
       }
     }
@@ -1992,6 +2144,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
                                              &algorithm,
                                              ngx_http_auth_jwt_get_grants_json)
       != NGX_OK) {
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_CLAIM_REQUIRED;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return NGX_ERROR;
   }
 
@@ -2001,6 +2155,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
 
     exp = ngx_http_auth_jwt_get_grant_time(r, ctx->jwt, "exp", NULL, NULL);
     if (exp == -1) {
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_CLAIM_REQUIRED;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
 
@@ -2013,6 +2169,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
                     exp, now, exp + cf->leeway);
       ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                     "auth_jwt: token: \"%s\"", (char *) ctx->token);
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_EXPIRED;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return NGX_ERROR;
     }
   }
@@ -2023,6 +2181,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
                                              &algorithm,
                                              ngx_http_auth_jwt_get_headers_json)
       != NGX_OK) {
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_HEADER_REQUIRED;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return NGX_ERROR;
   }
 
@@ -2030,6 +2190,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
   if (algorithm == JWT_ALG_NONE) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "auth_jwt: rejected due to none algorithm");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_ALG_NONE;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return NGX_ERROR;
   }
 
@@ -2042,6 +2204,8 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
   if (!ctx->keys) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "auth_jwt: rejected due to without signature key");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_NO_KEY;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return NGX_ERROR;
   }
 
@@ -2082,7 +2246,15 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
   ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                 "auth_jwt: token: \"%s\"", (char *) ctx->token);
 
+  ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_SIG_INVALID;
+  ctx->http_status = NGX_HTTP_UNAUTHORIZED;
   return NGX_ERROR;
+}
+
+static ngx_int_t
+ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r)
+{
+  return ngx_http_auth_jwt_handler(r, NGX_HTTP_REWRITE_PHASE);
 }
 
 static ngx_int_t
@@ -2114,12 +2286,18 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   if (cf->phase != phase) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                   "auth_jwt: ignore phase: %s",
-                  phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS");
+                  phase == NGX_HTTP_REWRITE_PHASE ? "REWRITE" :
+                  (phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS"));
     return NGX_DECLINED;
   }
 
   ctx = ngx_http_auth_jwt_get_module_ctx(r);
   if (ctx != NULL) {
+    /* For rewrite phase, just skip if already processed */
+    if (phase == NGX_HTTP_REWRITE_PHASE) {
+      return NGX_DECLINED;
+    }
+
     if (ctx->done < ctx->subrequest) {
       return NGX_AGAIN;
     }
@@ -2156,6 +2334,8 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
     if (variable->not_found) {
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                     "auth_jwt: token variable specified was not provided");
+      ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_NO_TOKEN;
+      ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return ngx_http_auth_jwt_http_error();
     }
     var.data = variable->data;
@@ -2174,6 +2354,8 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   if (var.len == 0) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "auth_jwt: token was not provided");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_NO_TOKEN;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return ngx_http_auth_jwt_http_error_without_token();
   }
 
@@ -2181,6 +2363,8 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   if (ctx->token == NULL) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                   "auth_jwt: failed to allocate token");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_ERROR;
+    ctx->http_status = NGX_HTTP_INTERNAL_SERVER_ERROR;
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
@@ -2189,6 +2373,8 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
       || ctx->jwt == NULL) {
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "auth_jwt: failed to parse jwt token");
+    ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_INVALID_TOKEN;
+    ctx->http_status = NGX_HTTP_UNAUTHORIZED;
     return ngx_http_auth_jwt_http_error();
   }
 
@@ -2200,6 +2386,11 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   /* validate */
   if (ngx_http_auth_jwt_validate(r, cf, ctx) == NGX_ERROR) {
     return ngx_http_auth_jwt_http_error();
+  }
+
+  /* For rewrite phase, continue to next handlers (if, rewrite, etc.) */
+  if (phase == NGX_HTTP_REWRITE_PHASE) {
+    return NGX_DECLINED;
   }
 
   return ngx_http_auth_jwt_http_ok();
