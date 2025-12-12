@@ -70,9 +70,12 @@ static ngx_int_t ngx_http_auth_jwt_pre_conf(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_jwt_post_conf(ngx_conf_t *cf);
 static void *ngx_http_auth_jwt_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
+static void *ngx_http_auth_jwt_create_srv_conf(ngx_conf_t *cf);
+static char *ngx_http_auth_jwt_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child);
 
 static void ngx_http_auth_jwt_exit_process(ngx_cycle_t *cycle);
 
+static ngx_int_t ngx_http_auth_jwt_server_rewrite_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_preaccess_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_jwt_access_handler(ngx_http_request_t *r);
@@ -150,7 +153,44 @@ typedef struct {
 typedef const char *(*auth_jwt_get)(jwt_t *jwt, const char *key, const char *delim, const char *quote);
 typedef char *(*auth_jwt_get_json)(jwt_t *jwt, const char *key, const char *delim, const char *quote);
 
+/* Server-level configuration for server_rewrite phase */
+typedef struct {
+  ngx_int_t token_variable;
+  ngx_array_t *set_vars;
+  time_t leeway;
+  ngx_int_t phase;
+  ngx_flag_t enabled;
+  ngx_flag_t allow_failed;
+  ngx_str_t realm;
+  struct {
+    json_t *subs;
+    json_t *kids;
+  } revocation;
+  struct {
+    ngx_array_t *files;
+    ngx_array_t *requests;
+    json_t *vars;
+  } key;
+  struct {
+    ngx_flag_t exp;
+    ngx_flag_t sig;
+    struct {
+      ngx_array_t *claims;
+      ngx_array_t *headers;
+    } requirement;
+    struct {
+      ngx_int_t error;
+      ngx_array_t *values;
+    } variable;
+  } validate;
+  struct {
+    char *delimiter;
+    char *quote;
+  } nested;
+} ngx_http_auth_jwt_srv_conf_t;
+
 static ngx_conf_enum_t ngx_http_auth_jwt_phases[] = {
+  { ngx_string("SERVER_REWRITE"), NGX_HTTP_SERVER_REWRITE_PHASE },
   { ngx_string("REWRITE"), NGX_HTTP_REWRITE_PHASE },
   { ngx_string("PREACCESS"), NGX_HTTP_PREACCESS_PHASE },
   { ngx_string("ACCESS"), NGX_HTTP_ACCESS_PHASE },
@@ -328,8 +368,8 @@ static ngx_http_module_t ngx_http_auth_jwt_module_ctx = {
   ngx_http_auth_jwt_post_conf,       /* postconfiguration */
   NULL,                              /* create main configuration */
   NULL,                              /* init main configuration */
-  NULL,                              /* create server configuration */
-  NULL,                              /* merge server configuration */
+  ngx_http_auth_jwt_create_srv_conf, /* create server configuration */
+  ngx_http_auth_jwt_merge_srv_conf,  /* merge server configuration */
   ngx_http_auth_jwt_create_loc_conf, /* create location configuration */
   ngx_http_auth_jwt_merge_loc_conf   /* merge location configuration */
 };
@@ -1316,6 +1356,12 @@ ngx_http_auth_jwt_post_conf(ngx_conf_t *cf)
 
   conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
+  handler = ngx_array_push(&conf->phases[NGX_HTTP_SERVER_REWRITE_PHASE].handlers);
+  if (handler == NULL) {
+    return NGX_ERROR;
+  }
+  *handler = ngx_http_auth_jwt_server_rewrite_handler;
+
   handler = ngx_array_push(&conf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
   if (handler == NULL) {
     return NGX_ERROR;
@@ -1502,6 +1548,133 @@ ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     for (i = 0; i < n; i++) {
       key_request[i] = var[i];
     }
+  }
+
+  ngx_conf_merge_sec_value(conf->leeway, prev->leeway, 0);
+
+  ngx_conf_merge_value(conf->phase, prev->phase, NGX_HTTP_ACCESS_PHASE);
+
+  ngx_conf_merge_value(conf->validate.exp, prev->validate.exp, 1);
+  ngx_conf_merge_value(conf->validate.sig, prev->validate.sig, 1);
+
+  ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
+  ngx_conf_merge_value(conf->allow_failed, prev->allow_failed, 0);
+  ngx_conf_merge_str_value(conf->realm, prev->realm, "");
+
+  if (prev->revocation.subs) {
+    if (conf->revocation.subs) {
+      json_object_update_missing(conf->revocation.subs, prev->revocation.subs);
+    }
+    else {
+      conf->revocation.subs = json_copy(prev->revocation.subs);
+    }
+  }
+
+  if (prev->revocation.kids) {
+    if (conf->revocation.kids) {
+      json_object_update_missing(conf->revocation.kids, prev->revocation.kids);
+    }
+    else {
+      conf->revocation.kids = json_copy(prev->revocation.kids);
+    }
+  }
+
+  if (prev->key.vars) {
+    if (conf->key.vars) {
+      json_object_update_missing(conf->key.vars, prev->key.vars);
+    }
+    else {
+      conf->key.vars = json_copy(prev->key.vars);
+    }
+  }
+
+  if (conf->nested.delimiter == NULL) {
+    if (prev->nested.delimiter) {
+      conf->nested.delimiter =
+        (char *) ngx_http_auth_jwt_strdup(cf->pool,
+                                          (u_char *) prev->nested.delimiter,
+                                          strlen(prev->nested.delimiter));
+    }
+  }
+  if (conf->nested.quote == NULL) {
+    if (prev->nested.quote) {
+      conf->nested.quote =
+        (char *) ngx_http_auth_jwt_strdup(cf->pool,
+                                          (u_char *) prev->nested.quote,
+                                          strlen(prev->nested.quote));
+    }
+  }
+
+  return NGX_CONF_OK;
+}
+
+static void *
+ngx_http_auth_jwt_create_srv_conf(ngx_conf_t *cf)
+{
+  ngx_http_auth_jwt_srv_conf_t *conf;
+
+  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_auth_jwt_srv_conf_t));
+  if (conf == NULL) {
+    return NGX_CONF_ERROR;
+  }
+
+  conf->token_variable = NGX_CONF_UNSET;
+  conf->set_vars = NGX_CONF_UNSET_PTR;
+  conf->leeway = NGX_CONF_UNSET;
+  conf->phase = NGX_CONF_UNSET;
+  conf->key.files = NULL;
+  conf->key.requests = NULL;
+  conf->key.vars = NULL;
+  conf->revocation.subs = NULL;
+  conf->revocation.kids = NULL;
+  conf->validate.requirement.claims = NULL;
+  conf->validate.requirement.headers = NULL;
+  conf->validate.variable.error = NGX_CONF_UNSET;
+  conf->validate.variable.values = NULL;
+  conf->validate.exp = NGX_CONF_UNSET;
+  conf->validate.sig = NGX_CONF_UNSET;
+  conf->nested.delimiter = NULL;
+  conf->nested.quote = NULL;
+
+  conf->enabled = NGX_CONF_UNSET;
+  conf->allow_failed = NGX_CONF_UNSET;
+
+  return conf;
+}
+
+static char *
+ngx_http_auth_jwt_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
+{
+  ngx_http_auth_jwt_srv_conf_t *prev = parent;
+  ngx_http_auth_jwt_srv_conf_t *conf = child;
+
+  ngx_conf_merge_value(conf->token_variable,
+                       prev->token_variable, NGX_CONF_UNSET);
+  ngx_conf_merge_ptr_value(conf->set_vars, prev->set_vars, NULL);
+
+  if (conf->key.files == NULL || conf->key.files->nelts == 0) {
+    conf->key.files = prev->key.files;
+  }
+
+  if (conf->validate.requirement.claims == NULL
+      || conf->validate.requirement.claims->nelts == 0) {
+    conf->validate.requirement.claims = prev->validate.requirement.claims;
+  }
+
+  if (conf->validate.requirement.headers == NULL
+      || conf->validate.requirement.headers->nelts == 0) {
+    conf->validate.requirement.headers = prev->validate.requirement.headers;
+  }
+
+  ngx_conf_merge_value(conf->validate.variable.error,
+                       prev->validate.variable.error, NGX_HTTP_UNAUTHORIZED);
+  if (conf->validate.variable.values == NULL
+      || conf->validate.variable.values->nelts == 0) {
+    conf->validate.variable.values = prev->validate.variable.values;
+  }
+
+  if (conf->key.requests == NULL || conf->key.requests->nelts == 0) {
+    conf->key.requests = prev->key.requests;
   }
 
   ngx_conf_merge_sec_value(conf->leeway, prev->leeway, 0);
@@ -2252,6 +2425,12 @@ ngx_http_auth_jwt_validate(ngx_http_request_t *r,
 }
 
 static ngx_int_t
+ngx_http_auth_jwt_server_rewrite_handler(ngx_http_request_t *r)
+{
+  return ngx_http_auth_jwt_handler(r, NGX_HTTP_SERVER_REWRITE_PHASE);
+}
+
+static ngx_int_t
 ngx_http_auth_jwt_rewrite_handler(ngx_http_request_t *r)
 {
   return ngx_http_auth_jwt_handler(r, NGX_HTTP_REWRITE_PHASE);
@@ -2278,6 +2457,12 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   ngx_pool_cleanup_t *cleanup;
   ngx_str_t var = ngx_string("");
 
+  /*
+   * Use loc_conf for all phases including SERVER_REWRITE.
+   * In nginx, server-level directives are stored in the "root" loc_conf
+   * of the server block, and ngx_http_get_module_loc_conf() works correctly
+   * even in the server_rewrite phase.
+   */
   cf = ngx_http_get_module_loc_conf(r, ngx_http_auth_jwt_module);
 
   if (cf->enabled != 1) {
@@ -2286,15 +2471,16 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
   if (cf->phase != phase) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                   "auth_jwt: ignore phase: %s",
-                  phase == NGX_HTTP_REWRITE_PHASE ? "REWRITE" :
-                  (phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS"));
+                  phase == NGX_HTTP_SERVER_REWRITE_PHASE ? "SERVER_REWRITE" :
+                  (phase == NGX_HTTP_REWRITE_PHASE ? "REWRITE" :
+                  (phase == NGX_HTTP_PREACCESS_PHASE ? "PREACCESS" : "ACCESS")));
     return NGX_DECLINED;
   }
 
   ctx = ngx_http_auth_jwt_get_module_ctx(r);
   if (ctx != NULL) {
-    /* For rewrite phase, just skip if already processed */
-    if (phase == NGX_HTTP_REWRITE_PHASE) {
+    /* For rewrite phases, just skip if already processed */
+    if (phase == NGX_HTTP_SERVER_REWRITE_PHASE || phase == NGX_HTTP_REWRITE_PHASE) {
       return NGX_DECLINED;
     }
 
@@ -2388,8 +2574,8 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
     return ngx_http_auth_jwt_http_error();
   }
 
-  /* For rewrite phase, continue to next handlers (if, rewrite, etc.) */
-  if (phase == NGX_HTTP_REWRITE_PHASE) {
+  /* For rewrite phases, continue to next handlers (if, rewrite, etc.) */
+  if (phase == NGX_HTTP_SERVER_REWRITE_PHASE || phase == NGX_HTTP_REWRITE_PHASE) {
     return NGX_DECLINED;
   }
 

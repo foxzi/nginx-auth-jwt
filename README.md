@@ -247,15 +247,18 @@ when verifying the exp and nbf JWT claims.
 
 <a name="auth_jwt_phase"></a>
 ```
-Syntax: auth_jwt_phase rewrite | preaccess | access;
+Syntax: auth_jwt_phase server_rewrite | rewrite | preaccess | access;
 Default: auth_jwt_phase access;
 Context: http, server, location
 ```
 
 Specifies the phase to be processed.
 
-- `rewrite` - JWT is validated during the rewrite phase, **before** `if` directives.
-  This allows using `$jwt_status` in `if` conditions.
+- `server_rewrite` - JWT is validated during the server rewrite phase, **before** location selection.
+  This allows using `$jwt_status` in server-level `if` directives for routing decisions.
+  Configuration must be set at server level (not in location blocks).
+- `rewrite` - JWT is validated during the location rewrite phase, **after** location selection but **before** location-level `if` directives.
+  This allows using `$jwt_status` in location-level `if` conditions.
 - `preaccess` - JWT is validated during the preaccess phase.
 - `access` - JWT is validated during the access phase (default).
 
@@ -265,8 +268,15 @@ Specifies the phase to be processed.
 > [auth\_jwt\_key\_request](#auth_jwt_key_request) cannot
 > be processed. (nested in-memory subrequest)
 
-> **Note:** When using `phase=rewrite`, the `$jwt_status` variable becomes
+> **Note:** When using `phase=rewrite` or `phase=server_rewrite`, the `$jwt_status` variable becomes
 > available in `if` directives for custom authentication flows.
+
+> **Phase execution order:**
+> 1. `server_rewrite` - server-level `if`, `set`, `rewrite` (JWT not yet processed if using other phases)
+> 2. Location selection
+> 3. `rewrite` - location-level `if`, `set`, `rewrite`
+> 4. `preaccess` - limit_req, limit_conn
+> 5. `access` - auth_basic, allow/deny
 
 <a name="auth_jwt_revocation_list_sub"></a>
 ```
@@ -492,30 +502,54 @@ This allows custom handling of authentication failures using `if` directives
 or passing the status to backend services.
 
 > **Important:** To use `$jwt_status` in `if` directives, you must set
-> `auth_jwt_phase rewrite;` because `if` directives are processed during
-> the rewrite phase, which runs before the default access phase.
+> the appropriate phase:
+> - `auth_jwt_phase server_rewrite;` - for server-level `if` (before location selection)
+> - `auth_jwt_phase rewrite;` - for location-level `if` (after location selection)
 
 > Examples:
 >
-> **Using with `if` directives (requires `phase=rewrite`):**
+> **Using with server-level `if` directives (requires `phase=server_rewrite`):**
 > ```nginx
 > server {
->     auth_jwt "realm" phase=rewrite;
+>     auth_jwt "realm";
 >     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_phase server_rewrite;
 >     auth_jwt_allow_failed on;
 >
->     # Redirect to login if no token or invalid token
->     if ($jwt_status = "no_token") {
->         return 302 /login?return=$request_uri;
+>     # Server-level routing based on JWT claims (before location selection)
+>     if ($jwt_claim_role = "admin") {
+>         set $backend admin_backend;
 >     }
->     if ($jwt_status = "expired") {
->         return 302 /login?return=$request_uri;
->     }
->     if ($jwt_status = "invalid_token") {
->         return 302 /login?return=$request_uri;
+>     if ($jwt_claim_role != "admin") {
+>         set $backend user_backend;
 >     }
 >
 >     location / {
+>         proxy_pass http://$backend;
+>     }
+> }
+> ```
+>
+> **Using with location-level `if` directives (requires `phase=rewrite`):**
+> ```nginx
+> server {
+>     location / {
+>         auth_jwt "realm";
+>         auth_jwt_key_file /etc/nginx/keys.jwks;
+>         auth_jwt_phase rewrite;
+>         auth_jwt_allow_failed on;
+>
+>         # Redirect to login if no token or invalid token
+>         if ($jwt_status = "no_token") {
+>             return 302 /login?return=$request_uri;
+>         }
+>         if ($jwt_status = "expired") {
+>             return 302 /login?return=$request_uri;
+>         }
+>         if ($jwt_status = "invalid_token") {
+>             return 302 /login?return=$request_uri;
+>         }
+>
 >         proxy_pass http://backend;
 >     }
 > }
