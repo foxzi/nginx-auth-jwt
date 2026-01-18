@@ -65,6 +65,7 @@ static char *ngx_http_auth_jwt_conf_set_revocation(ngx_conf_t *cf, ngx_command_t
 static char * ngx_http_auth_jwt_conf_set_requirement(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_auth_jwt_conf_set_require_variable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_auth_jwt_conf_set_allow_nested(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_auth_jwt_conf_set_log_level(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static ngx_int_t ngx_http_auth_jwt_pre_conf(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_jwt_post_conf(ngx_conf_t *cf);
@@ -90,6 +91,7 @@ typedef struct {
   ngx_int_t phase;
   ngx_flag_t enabled;
   ngx_flag_t allow_failed;
+  ngx_uint_t log_level;
   ngx_str_t realm;
   struct {
     json_t *subs;
@@ -161,6 +163,7 @@ typedef struct {
   ngx_int_t phase;
   ngx_flag_t enabled;
   ngx_flag_t allow_failed;
+  ngx_uint_t log_level;
   ngx_str_t realm;
   struct {
     json_t *subs;
@@ -359,6 +362,12 @@ static ngx_command_t ngx_http_auth_jwt_commands[] = {
     ngx_conf_set_flag_slot,
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_auth_jwt_loc_conf_t, allow_failed),
+    NULL },
+  { ngx_string("auth_jwt_log_level"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    ngx_http_auth_jwt_conf_set_log_level,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
     NULL },
   ngx_null_command
 };
@@ -1330,6 +1339,35 @@ ngx_http_auth_jwt_conf_set_allow_nested(ngx_conf_t *cf,
   return NGX_CONF_OK;
 }
 
+static char *
+ngx_http_auth_jwt_conf_set_log_level(ngx_conf_t *cf,
+                                     ngx_command_t *cmd, void *conf)
+{
+  ngx_http_auth_jwt_loc_conf_t *lcf = conf;
+  ngx_str_t *value;
+
+  value = cf->args->elts;
+
+  if (ngx_strcasecmp(value[1].data, (u_char *) "error") == 0) {
+    lcf->log_level = NGX_LOG_ERR;
+  } else if (ngx_strcasecmp(value[1].data, (u_char *) "warn") == 0) {
+    lcf->log_level = NGX_LOG_WARN;
+  } else if (ngx_strcasecmp(value[1].data, (u_char *) "info") == 0) {
+    lcf->log_level = NGX_LOG_INFO;
+  } else if (ngx_strcasecmp(value[1].data, (u_char *) "debug") == 0) {
+    lcf->log_level = NGX_LOG_DEBUG;
+  } else if (ngx_strcasecmp(value[1].data, (u_char *) "off") == 0) {
+    lcf->log_level = 0;
+  } else {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "invalid auth_jwt_log_level value \"%V\", "
+                       "must be: error, warn, info, debug, or off", &value[1]);
+    return NGX_CONF_ERROR;
+  }
+
+  return NGX_CONF_OK;
+}
+
 static ngx_int_t
 ngx_http_auth_jwt_pre_conf(ngx_conf_t *cf)
 {
@@ -1413,6 +1451,7 @@ ngx_http_auth_jwt_create_loc_conf(ngx_conf_t *cf)
 
   conf->enabled = NGX_CONF_UNSET;
   conf->allow_failed = NGX_CONF_UNSET;
+  conf->log_level = NGX_CONF_UNSET_UINT;
 
   return conf;
 }
@@ -1559,6 +1598,7 @@ ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
   ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
   ngx_conf_merge_value(conf->allow_failed, prev->allow_failed, 0);
+  ngx_conf_merge_uint_value(conf->log_level, prev->log_level, NGX_LOG_ERR);
   ngx_conf_merge_str_value(conf->realm, prev->realm, "");
 
   if (prev->revocation.subs) {
@@ -1638,6 +1678,7 @@ ngx_http_auth_jwt_create_srv_conf(ngx_conf_t *cf)
 
   conf->enabled = NGX_CONF_UNSET;
   conf->allow_failed = NGX_CONF_UNSET;
+  conf->log_level = NGX_CONF_UNSET_UINT;
 
   return conf;
 }
@@ -1686,6 +1727,7 @@ ngx_http_auth_jwt_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
   ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
   ngx_conf_merge_value(conf->allow_failed, prev->allow_failed, 0);
+  ngx_conf_merge_uint_value(conf->log_level, prev->log_level, NGX_LOG_ERR);
   ngx_conf_merge_str_value(conf->realm, prev->realm, "");
 
   if (prev->revocation.subs) {
@@ -2518,8 +2560,10 @@ ngx_http_auth_jwt_handler(ngx_http_request_t *r, ngx_int_t phase)
     /* token from variable */
     variable = ngx_http_get_indexed_variable(r, cf->token_variable);
     if (variable->not_found) {
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "auth_jwt: token variable specified was not provided");
+      if (cf->log_level > 0) {
+        ngx_log_error(cf->log_level, r->connection->log, 0,
+                      "auth_jwt: token variable specified was not provided");
+      }
       ctx->jwt_status = NGX_HTTP_AUTH_JWT_STATUS_NO_TOKEN;
       ctx->http_status = NGX_HTTP_UNAUTHORIZED;
       return ngx_http_auth_jwt_http_error();
