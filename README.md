@@ -97,6 +97,7 @@ location / {
 - [auth\_jwt\_require\_header](#auth_jwt_require_header)
 - [auth\_jwt\_allow\_nested](#auth_jwt_allow_nested)
 - [auth\_jwt\_allow\_failed](#auth_jwt_allow_failed)
+- [auth\_jwt\_log\_level](#auth_jwt_log_level)
 
 <a name="auth_jwt"></a>
 ```
@@ -590,6 +591,39 @@ or passing the status to backend services.
 >
 >     proxy_set_header X-JWT-Status $jwt_status;
 >     proxy_set_header X-JWT-Status-Code $jwt_status_code;
+>     proxy_pass http://backend;
+> }
+> ```
+
+<a name="auth_jwt_log_level"></a>
+```
+Syntax: auth_jwt_log_level error | warn | info | debug | off;
+Default: auth_jwt_log_level error;
+Context: http, server, location
+```
+
+Sets the log level for the "token variable specified was not provided" message.
+This is useful when using `token=$cookie_*` variables where missing cookies
+are expected behavior (e.g., first visit before authentication).
+
+- `error` - Log as error (default, for backward compatibility)
+- `warn` - Log as warning
+- `info` - Log as info (only visible with `error_log` level info or debug)
+- `debug` - Log as debug
+- `off` - Suppress the message completely
+
+> Example:
+> ```nginx
+> location / {
+>     auth_jwt "realm" token=$cookie_auth_token;
+>     auth_jwt_key_file /etc/nginx/keys.jwks;
+>     auth_jwt_allow_failed on;
+>     auth_jwt_log_level off;  # Suppress "no token" errors
+>
+>     if ($jwt_status = "no_token") {
+>         return 302 /login;
+>     }
+>
 >     proxy_pass http://backend;
 > }
 > ```
